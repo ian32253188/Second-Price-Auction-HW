@@ -7,6 +7,7 @@ from lifelines import WeibullAFTFitter
 import warnings
 import os
 from collections import Counter
+import datetime
 
 warnings.filterwarnings('ignore')
 
@@ -16,7 +17,12 @@ class RTBBiddingSystem:
         self.DAY_BUDGET = 5000
         self.pctr_min = 1e-4  # 最低可接受的預測點擊率
         self.rho_cut = 2e-5   # 性價比門檻 (pCTR / win_price)
-        self.hourly_budget = [self.DAY_BUDGET // 24] * 24 # 平均每小時預算
+        
+        # 動態調整每小時預算，根據歷史競價情況分配，而不是均分
+        hour_weights = [0.5, 0.3, 0.2, 0.2, 0.3, 0.5, 0.8, 1.2, 1.5, 1.3, 1.1, 1.0, 
+                        1.0, 1.1, 1.3, 1.5, 1.8, 1.5, 1.3, 1.0, 0.8, 0.6, 0.5, 0.4]
+        total_weight = sum(hour_weights)
+        self.hourly_budget = [(self.DAY_BUDGET * w / total_weight) for w in hour_weights]
 
         # 模型
         self.ctr_model = None
@@ -209,6 +215,39 @@ class RTBBiddingSystem:
                  df_processed.drop('key_page_url', axis=1, inplace=True, errors='ignore')
 
 
+        # 新特徵工程部分
+        # 1. 時間特徵增強
+        df_processed['time_segment'] = pd.cut(
+            df_processed['hour'], 
+            bins=[0, 6, 12, 18, 24], 
+            labels=['night', 'morning', 'afternoon', 'evening']
+        )
+        # 將時段轉換為數值
+        if is_train:
+            le_time = LabelEncoder()
+            df_processed['time_segment'] = le_time.fit_transform(df_processed['time_segment'])
+            self.feature_encoders['time_segment_encoder'] = le_time
+        else:
+            le_time = self.feature_encoders.get('time_segment_encoder')
+            if le_time is not None:
+                df_processed['time_segment'] = le_time.transform(df_processed['time_segment'])
+            else:
+                df_processed['time_segment'] = 0
+
+        # 2. 添加交互特徵 - domain與時段的組合
+        if 'domain' in df_processed.columns and 'time_segment' in df_processed.columns:
+            df_processed['domain_time'] = df_processed['domain'] * 10 + df_processed['time_segment']
+
+
+        # 確保所有 winprice_features 都有值
+        if self.winprice_features is None:
+            self.winprice_features = []  # 初始化為空列表，避免錯誤
+
+        for col in self.winprice_features:
+            if col in df_processed.columns:
+                if df_processed[col].isnull().any():
+                    df_processed[col] = df_processed[col].fillna(0)
+
         return df_processed
 
     def prepare_training_data(self):
@@ -268,12 +307,11 @@ class RTBBiddingSystem:
             'objective': 'binary',
             'metric': ['binary_logloss', 'auc', 'average_precision'],
             'boosting_type': 'gbdt',
-            'num_leaves': 31,
-            'learning_rate': 0.05,
-            'feature_fraction': 0.8,
-            'bagging_fraction': 0.8,
-            'bagging_freq': 5,
-            'min_child_samples': 20,
+            'num_leaves': 63,  # 增加到 63（從31）
+            'learning_rate': 0.03,  # 降低學習率
+            'feature_fraction': 0.9,  # 增加特徵抽樣比例
+            'bagging_fraction': 0.9,
+            'min_data_in_leaf': 10,  # 減少，讓模型更容易學習稀有正樣本
             'scale_pos_weight': neg_count/pos_count,  # 只保留這個
             'verbose': -1,
             'n_jobs': -1,
@@ -286,7 +324,7 @@ class RTBBiddingSystem:
         )
 
         # 4. 決定是否需要資料採樣
-        use_sampling = False  # 設為 True 啟用資料採樣
+        use_sampling = True  # 啟用資料採樣
         if use_sampling and pos_count / len(self.y_ctr) < 0.01:  # 如果正樣本比例過低才採樣
             print("執行資料採樣，平衡正負樣本比例...")
             # 方法一：欠採樣 (簡單隨機抽樣)
@@ -294,7 +332,7 @@ class RTBBiddingSystem:
             neg_indices = np.where(y_tr == 0)[0]
             
             # 採樣負樣本，保持 10:1 的比例
-            target_ratio = 10  # 負:正 = 10:1
+            target_ratio = 5  # 負:正 = 5:1，讓模型更容易學習正樣本模式
             sampled_neg_indices = np.random.choice(
                 neg_indices, 
                 size=min(len(neg_indices), len(pos_indices) * target_ratio), 
@@ -356,7 +394,7 @@ class RTBBiddingSystem:
         
         # 選擇性: 僅使用重要特徵重訓練 (如果特徵數量大幅減少)
         if len(self.important_features) > 5 and len(self.important_features) < len(self.feature_columns) / 2:
-            use_important_features_only = False  # 設為 True 啟用重要特徵重訓練
+            use_important_features_only = False  # 設為 True 啟用重要特徵重訓
             if use_important_features_only:
                 print("\n使用重要特徵重訓練模型...")
                 X_tr_important = X_tr[self.important_features]
@@ -558,66 +596,84 @@ class RTBBiddingSystem:
         spent_per_hour = [0] * 24
         bid_results = []
         
-        # --- 優化點：預處理整個測試集 ---
+        # 預處理整個測試集
         print("預處理整個測試集進行出價...")
-        processed_test_df = self.preprocess_features(self.test_day1.copy(), is_train=False) # 使用副本
+        processed_test_df = self.preprocess_features(self.test_day1.copy(), is_train=False)
         print("測試集預處理完成。")
 
-        # 確保 CTR 模型和 Win-Price 模型所需的特徵都存在於 processed_test_df
-        missing_ctr_cols = [col for col in self.feature_columns if col not in processed_test_df.columns]
-        if missing_ctr_cols:
-            print(f"錯誤：預處理後的測試集缺少 CTR 模型所需的特徵: {missing_ctr_cols}")
-            return None
+        # 批量預測CTR
+        batch_size = 10000
+        for i in range(0, len(processed_test_df), batch_size):
+            batch = processed_test_df.iloc[i:i+batch_size]
+            ctr_preds = self.ctr_model.predict(
+                batch[self.feature_columns], 
+                num_iteration=self.ctr_model.best_iteration
+            )
+            processed_test_df.loc[batch.index, 'predicted_ctr'] = ctr_preds
         
-        missing_wp_cols = [col for col in self.winprice_features if col not in processed_test_df.columns]
-        if missing_wp_cols:
-            print(f"錯誤：預處理後的測試集缺少 Win-Price 模型所需的特徵: {missing_wp_cols}")
-            return None
-        # --- 優化點結束 ---
-
+        # 檢查CTR預測結果
+        print(f"CTR預測結果統計:")
+        print(f"- 平均值: {processed_test_df['predicted_ctr'].mean()}")
+        print(f"- 最小值: {processed_test_df['predicted_ctr'].min()}")
+        print(f"- 最大值: {processed_test_df['predicted_ctr'].max()}")
+        print(f"- 高於閾值({self.pctr_min})的比例: {(processed_test_df['predicted_ctr'] > self.pctr_min).mean()*100:.2f}%")
+        
+        # 批量預測win_price
+        batch_size = 10000
+        for i in range(0, len(processed_test_df), batch_size):
+            batch = processed_test_df.iloc[i:i+batch_size]
+            batch_winprice = batch[self.winprice_features].copy()
+            batch_winprice = batch_winprice.fillna(0)
+            win_price_preds = self.winprice_model.predict_expectation(batch_winprice)
+            processed_test_df.loc[batch.index, 'predicted_win_price'] = np.exp(win_price_preds)
+        
+        # 檢查win_price預測結果
+        print(f"Win-Price預測結果統計:")
+        print(f"- 平均值: {processed_test_df['predicted_win_price'].mean()}")
+        print(f"- 最小值: {processed_test_df['predicted_win_price'].min()}")
+        print(f"- 最大值: {processed_test_df['predicted_win_price'].max()}")
+        print("Win-Price 預測用特徵 NaN 檢查：")
+        print(processed_test_df[self.winprice_features].isnull().sum())
+        print("Win-Price 預測用特徵型態：")
+        print(processed_test_df[self.winprice_features].dtypes)
+        
+        # 簡化出價策略，確保有出價
         num_bids_made = 0
         total_spent_if_won = 0
 
-        # 使用 processed_test_df 進行迭代
-        # 為了能同時訪問原始 test_day1 的 'timestamp' (如果 preprocess_features 移除了它)
-        # 和 processed_test_df 的特徵，可以考慮合併或使用索引對齊
-        # 這裡假設 'hour' 已經在 processed_test_df 中被正確產生和保留
-        # 並且 'bid_id' 也被保留或可以從索引獲得
-
         for idx in range(len(processed_test_df)):
-            processed_row = processed_test_df.iloc[idx] # 獲取已處理的行 (Pandas Series)
-            original_row = self.test_day1.iloc[idx] # 獲取原始行，以備不時之需 (例如原始 bidding_price)
+            processed_row = processed_test_df.iloc[idx]
+            original_row = self.test_day1.iloc[idx]
 
-            current_hour = int(processed_row.get('hour', 0)) # 假設 'hour' 在 processed_row 中
-            bid_id = original_row.get('bid_id', f"unknown_bid_{idx}") # 從原始資料獲取 bid_id
+            current_hour = int(processed_row.get('hour', 0))
+            bid_id = original_row.get('bid_id', f"unknown_bid_{idx}")
             
             bid_price_for_this_impression = 0
 
             if spent_per_hour[current_hour] >= self.hourly_budget[current_hour] or remaining_budget <= 0:
                 bid_price_for_this_impression = 0
             else:
-                # --- 修改：使用新的預測方法 ---
-                predicted_ctr = self.predict_CTR_from_processed(processed_row)
-
-                if predicted_ctr < self.pctr_min:
+                predicted_ctr = processed_row.get('predicted_ctr', self.pctr_min)
+                
+                # 放寬CTR閾值條件
+                if predicted_ctr < self.pctr_min * 0.1:  # 降低閾值為原來的10%
                     bid_price_for_this_impression = 0
                 else:
-                    # 如果 predict_winprice_from_processed 需要原始 bidding_price 作為備用
-                    # 可以這樣傳遞: self.predict_winprice_from_processed(processed_row, original_row.get('bidding_price'))
-                    # 但為了簡化，假設 predict_winprice_from_processed 內部有備用邏輯
-                    predicted_win_price = self.predict_winprice_from_processed(processed_row)
-                    # --- 修改結束 ---
+                    predicted_win_price = processed_row.get('predicted_win_price', 0)
+                    
+                    # 修正：處理 NaN 或 inf
+                    if not np.isfinite(predicted_win_price) or predicted_win_price <= 0:
+                        predicted_win_price = 1  # 給一個最小有效值
 
-                    if predicted_win_price <= 0:
-                        bid_price_for_this_impression = 0
+                    # 簡化出價策略 - 直接出價 = 預測勝價 + 1
+                    potential_bid = max(int(predicted_win_price) + 1, 1)
+                    
+                    # 檢查預算限制
+                    if remaining_budget >= potential_bid and \
+                       (spent_per_hour[current_hour] + potential_bid) <= self.hourly_budget[current_hour]:
+                        bid_price_for_this_impression = potential_bid
                     else:
-                        potential_bid = predicted_win_price + 1 
-
-                        if remaining_budget >= potential_bid and \
-                           (spent_per_hour[current_hour] + potential_bid) <= self.hourly_budget[current_hour]:
-                            bid_price_for_this_impression = potential_bid
-                        else:
-                            bid_price_for_this_impression = 0
+                        bid_price_for_this_impression = 0
             
             if bid_price_for_this_impression > 0:
                 remaining_budget -= bid_price_for_this_impression
@@ -636,16 +692,15 @@ class RTBBiddingSystem:
                       f"出價次數: {num_bids_made}. "
                       f"假設花費: {total_spent_if_won:.2f}")
 
+        # 儲存結果
         result_df = pd.DataFrame(bid_results)
-        output_filename = f"{self.student_id}_day1.csv"
-        try:
-            result_df.to_csv(output_filename, index=False)
-            print(f"\nDay1 出價完成，結果已儲存至: {output_filename}")
-            print(f"總出價次數 (paying_price > 0): {(result_df['paying_price'] > 0).sum()}")
-            print(f"總出價金額 (假設都贏得且按此價格支付): {result_df['paying_price'].sum()}")
-            print(f"剩餘總預算: {remaining_budget:.2f}")
-        except Exception as e:
-            print(f"儲存出價結果時發生錯誤: {e}")
+        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")  # 新增這行
+        output_filename = f"{self.student_id}_day1_{now_str}.csv"    # 修改這行
+        result_df.to_csv(output_filename, index=False)
+        print(f"\nDay1 出價完成，結果已儲存至: {output_filename}")
+        print(f"總出價次數 (paying_price > 0): {(result_df['paying_price'] > 0).sum()}")
+        print(f"總出價金額 (假設都贏得且按此價格支付): {result_df['paying_price'].sum()}")
+        print(f"剩餘總預算: {remaining_budget:.2f}")
         
         return result_df
 
