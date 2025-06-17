@@ -8,7 +8,7 @@ import warnings
 import os
 from collections import Counter
 import datetime
-from sklearn.metrics import classification_report, f1_score
+import datetime
 
 warnings.filterwarnings('ignore')
 
@@ -18,8 +18,6 @@ class RTBBiddingSystem:
         self.DAY_BUDGET = 5000
         self.pctr_min = 1e-4  # 最低可接受的預測點擊率
         self.rho_cut = 2e-5   # 性價比門檻 (pCTR / win_price)
-
-        # 生成統一的時間戳
         self.timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # 動態調整每小時預算，根據歷史競價情況分配，而不是均分
@@ -36,7 +34,7 @@ class RTBBiddingSystem:
 
         # 資料
         self.train_data = None
-        self.test_day2 = None
+        self.test_day1 = None
         self.X_train = None
         self.y_ctr = None
         self.feature_columns = None # 用於模型訓練的特徵欄位名稱
@@ -47,9 +45,9 @@ class RTBBiddingSystem:
         print("載入資料中...")
         try:
             self.train_data = pd.read_csv('data/train.csv')
-            self.test_day2 = pd.read_csv('data/test_day2.csv')
+            self.test_day1 = pd.read_csv('data/test_day1.csv')
             print(f"訓練集大小: {self.train_data.shape}")
-            print(f"測試集大小: {self.test_day2.shape}")
+            print(f"測試集大小: {self.test_day1.shape}")
         except FileNotFoundError as e:
             print(f"錯誤：找不到資料檔案 {e.filename}")
             raise
@@ -298,19 +296,20 @@ class RTBBiddingSystem:
             print("錯誤：訓練資料 (X_train 或 y_ctr) 未準備好。請先呼叫 prepare_training_data()。")
             return
         
+        # 匯入視覺化所需的模組
         import matplotlib.pyplot as plt
         import seaborn as sns
-        from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve
+        from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve, classification_report, f1_score
         import os
         
         # 使用統一的時間戳建立資料夾
-        viz_dir = f"ctr_model_visualization_{self.timestamp}"
+        viz_dir = f"ctr_model_visualization_{self.student_id}_{self.timestamp}"
         os.makedirs(viz_dir, exist_ok=True)
         
         # 設定中文字體
         plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
         plt.rcParams['axes.unicode_minus'] = False
-        
+
         # 1. 類別不平衡分析與視覺化
         neg_count = sum(self.y_ctr == 0)
         pos_count = sum(self.y_ctr == 1)
@@ -345,45 +344,45 @@ class RTBBiddingSystem:
         plt.tight_layout()
         plt.savefig(f'{viz_dir}/01_class_distribution.png', dpi=300, bbox_inches='tight')
         plt.close()
-        
-        # 2. 模型參數設定
+
+        # 2. 設定更好的參數處理不平衡資料
         params = {
             'objective': 'binary',
-            'metric': ['binary_logloss', 'auc'],
-            'verbose': 10,  # 增加輸出以觀察訓練過程
+            'metric': ['binary_logloss', 'auc'],  # 移除 average_precision 避免錯誤
             'boosting_type': 'gbdt',
-            'num_leaves': 31,
-            'learning_rate': 0.01,
-            'feature_fraction': 0.9,
+            'num_leaves': 63,  # 增加到 63（從31）
+            'learning_rate': 0.03,  # 降低學習率
+            'feature_fraction': 0.9,  # 增加特徵抽樣比例
             'bagging_fraction': 0.9,
-            'min_data_in_leaf': 50,
-            'scale_pos_weight': 1,
+            'min_data_in_leaf': 10,  # 減少，讓模型更容易學習稀有正樣本
+            'scale_pos_weight': neg_count/pos_count,  # 只保留這個
+            'verbose': 10,  # 增加輸出以觀察訓練過程
             'n_jobs': -1,
-            'seed': 42,
-            'num_boost_round': 2000,  # 增加最大迭代次數
-            'reg_alpha': 0.1,  # 加入正則化
-            'reg_lambda': 0.1,
+            'seed': 42
         }
-        
-        # 3. 切分資料
+
+        # 3. 切分資料 (使用分層抽樣確保正樣本比例一致)
         X_tr, X_val, y_tr, y_val = train_test_split(
             self.X_train, self.y_ctr, test_size=0.2, random_state=42, stratify=self.y_ctr
         )
-        
-        # 4. 資料採樣與視覺化
-        use_sampling = True
-        if use_sampling and pos_count / len(self.y_ctr) < 0.01:
+
+        # 4. 決定是否需要資料採樣
+        use_sampling = True  # 啟用資料採樣
+        if use_sampling and pos_count / len(self.y_ctr) < 0.01:  # 如果正樣本比例過低才採樣
             print("執行資料採樣，平衡正負樣本比例...")
+            # 方法一：欠採樣 (簡單隨機抽樣)
             pos_indices = np.where(y_tr == 1)[0]
             neg_indices = np.where(y_tr == 0)[0]
             
-            target_ratio = 1
+            # 採樣負樣本，保持 5:1 的比例
+            target_ratio = 5  # 負:正 = 5:1，讓模型更容易學習正樣本模式
             sampled_neg_indices = np.random.choice(
                 neg_indices, 
                 size=min(len(neg_indices), len(pos_indices) * target_ratio), 
                 replace=False
             )
             
+            # 合併正樣本和採樣後的負樣本
             sampled_indices = np.concatenate([pos_indices, sampled_neg_indices])
             X_tr_sampled = X_tr.iloc[sampled_indices]
             y_tr_sampled = y_tr.iloc[sampled_indices]
@@ -412,13 +411,15 @@ class RTBBiddingSystem:
             plt.savefig(f'{viz_dir}/02_sampling_comparison.png', dpi=300, bbox_inches='tight')
             plt.close()
             
+            # 使用採樣後的資料
             train_data = lgb.Dataset(X_tr_sampled, label=y_tr_sampled)
             print(f"採樣後訓練集大小: {len(X_tr_sampled)}, 正樣本比例: {sum(y_tr_sampled)/len(y_tr_sampled)*100:.2f}%")
         else:
+            # 使用原始資料
             train_data = lgb.Dataset(X_tr, label=y_tr)
 
         valid_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
-        
+
         # 5. 訓練模型 (儲存訓練歷史)
         print("開始模型訓練...")
         evals_result = {}
@@ -429,7 +430,7 @@ class RTBBiddingSystem:
             valid_names=['train', 'valid'],
             num_boost_round=1000,
             callbacks=[
-                lgb.early_stopping(stopping_rounds=200), 
+                lgb.early_stopping(stopping_rounds=50), 
                 lgb.log_evaluation(100),
                 lgb.record_evaluation(evals_result)  # 記錄訓練過程
             ]
@@ -442,8 +443,6 @@ class RTBBiddingSystem:
         titles = ['Binary Log Loss', 'AUC']
 
         for i, (metric, title) in enumerate(zip(metrics, titles)):
-            if i >= 2:  # 只繪製前兩個圖
-                break
             row, col = i // 2, i % 2
             ax = axes[row, col]
             
@@ -457,6 +456,22 @@ class RTBBiddingSystem:
             ax.set_title(f'{title} 訓練曲線', fontweight='bold')
             ax.legend()
             ax.grid(True, alpha=0.3)
+        
+        # 第三個子圖：模型收斂分析
+        ax = axes[1, 0]
+        ax.axis('off')
+        convergence_info = f"""
+        模型收斂分析：
+        
+        • 最佳迭代: {self.ctr_model.best_iteration}
+        • 最終訓練 AUC: {evals_result['train']['auc'][-1]:.4f}
+        • 最終驗證 AUC: {evals_result['valid']['auc'][-1]:.4f}
+        • AUC 差距: {abs(evals_result['train']['auc'][-1] - evals_result['valid']['auc'][-1]):.4f}
+        
+        收斂狀態: {'✅ 正常' if abs(evals_result['train']['auc'][-1] - evals_result['valid']['auc'][-1]) < 0.1 else '⚠️ 可能過擬合'}
+        """
+        ax.text(0.1, 0.5, convergence_info, fontsize=11, va='center', 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.3))
         
         # 第四個子圖：訓練資訊摘要
         axes[1, 1].axis('off')
@@ -472,18 +487,19 @@ class RTBBiddingSystem:
         • 訓練集大小: {len(train_data.get_label()):,}
         • 驗證集大小: {len(y_val):,}
         """
-        axes[1, 1].text(0.1, 0.5, info_text, fontsize=12, va='center', 
+        axes[1, 1].text(0.1, 0.5, info_text, fontsize=11, va='center', 
                         bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.5))
         
         plt.tight_layout()
         plt.savefig(f'{viz_dir}/03_training_curves.png', dpi=300, bbox_inches='tight')
         plt.close()
-        
+
         # 6. 特徵重要性分析與視覺化
         feature_importance = pd.DataFrame({
             'feature': self.feature_columns,
             'importance': self.ctr_model.feature_importance()
-        }).sort_values('importance', ascending=False)
+        })
+        feature_importance = feature_importance.sort_values('importance', ascending=False)
         
         print("\n前10個最重要特徵:")
         print(feature_importance.head(10))
@@ -508,32 +524,28 @@ class RTBBiddingSystem:
         plt.savefig(f'{viz_dir}/04_feature_importance.png', dpi=300, bbox_inches='tight')
         plt.close()
         
-        # 7. 重要特徵篩選
-        important_threshold = 10
+        # 7. 儲存最重要的特徵 (可用於縮減特徵空間)
+        important_threshold = 10  # 只保留重要性大於閾值的特徵
         self.important_features = feature_importance[
             feature_importance['importance'] > important_threshold
         ]['feature'].tolist()
         
         print(f"\n重要特徵 (重要性 > {important_threshold}) 數量: {len(self.important_features)}")
         
-        # 8. 模型評估與視覺化
+        # 8. 計算驗證集上的評估指標與視覺化
         y_pred_val = self.ctr_model.predict(X_val)
         auc = roc_auc_score(y_val, y_pred_val)
         ap = average_precision_score(y_val, y_pred_val)
         
         # 使用更適合不平衡資料的評估方式
-        from sklearn.metrics import classification_report, f1_score
-
-        # 設定更合理的決策閾值
         threshold = 0.1  # 而不是預設的 0.5
         y_pred_binary = (y_pred_val > threshold).astype(int)
-
         f1 = f1_score(y_val, y_pred_binary)
-        print(f"F1 Score: {f1:.4f}")
         
         print(f"\n驗證集評估指標:")
         print(f"- AUC: {auc:.4f}")
         print(f"- Average Precision: {ap:.4f}")
+        print(f"- F1 Score (threshold={threshold}): {f1:.4f}")
         
         # 📊 視覺化5: ROC 曲線與 PR 曲線
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
@@ -547,7 +559,7 @@ class RTBBiddingSystem:
         ax1.set_xlabel('False Positive Rate')
         ax1.set_ylabel('True Positive Rate')
         ax1.set_title('ROC 曲線', fontweight='bold')
-        ax1.legend()
+        ax1.legend(loc="lower right")
         ax1.grid(True, alpha=0.3)
         
         # PR 曲線
@@ -573,9 +585,9 @@ class RTBBiddingSystem:
         y_pred_neg = y_pred_val[y_val == 0]
         
         plt.hist(y_pred_neg, bins=50, alpha=0.7, label=f'未點擊 (n={len(y_pred_neg)})', 
-                 color='lightcoral', density=True)
+                color='lightcoral', density=True)
         plt.hist(y_pred_pos, bins=50, alpha=0.7, label=f'已點擊 (n={len(y_pred_pos)})', 
-                 color='lightblue', density=True)
+                color='lightblue', density=True)
         
         plt.xlabel('預測機率')
         plt.ylabel('密度')
@@ -618,6 +630,7 @@ class RTBBiddingSystem:
         評估指標：
         - AUC: {auc:.4f}
         - Average Precision: {ap:.4f}
+        - F1 Score: {f1:.4f}
         
         前5個重要特徵：
         {feature_importance.head(5).to_string(index=False)}
@@ -632,36 +645,40 @@ class RTBBiddingSystem:
         print(f"📊 視覺化檔案已儲存至: {viz_dir}/")
         print(f"📄 訓練報告已儲存: {viz_dir}/training_report.txt")
         
-        # 重要特徵重訓練邏輯保持不變...
-        # (省略以節省空間，邏輯與原版相同)
+        print("\nCTR 模型訓練完成。")
+        
+        # 選擇性: 僅使用重要特徵重訓練 (如果特徵數量大幅減少)
+        if len(self.important_features) > 5 and len(self.important_features) < len(self.feature_columns) / 2:
+            use_important_features_only = False  # 設為 True 啟用重要特徵重訓
+            if use_important_features_only:
+                print("\n使用重要特徵重訓練模型...")
+                X_tr_important = X_tr[self.important_features]
+                X_val_important = X_val[self.important_features]
+                
+                train_data_important = lgb.Dataset(X_tr_important, label=y_tr)
+                valid_data_important = lgb.Dataset(X_val_important, label=y_val, reference=train_data_important)
+                
+                self.ctr_model = lgb.train(
+                    params,
+                    train_data_important,
+                    valid_sets=[train_data_important, valid_data_important],
+                    num_boost_round=1000,
+                    callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(100)]
+                )
+                
+                # 更新 feature_columns 為重要特徵
+                self.ctr_feature_columns = self.important_features.copy()
+                print("使用重要特徵重訓練完成。")
+
+
     def train_winprice_model(self):
-        """訓練 Win-Price 預測模型 (使用生存分析) - 完整修復版本"""
+        """訓練 Win-Price 預測模型 (使用生存分析)"""
         print("訓練 Win-Price 模型...")
         if self.train_data is None or self.processed_train_df is None or self.feature_columns is None:
             print("錯誤：訓練 Win-Price 模型所需的資料未準備好。")
             return
-        
-        # 匯入必要的模組
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        from sklearn.model_selection import KFold
-        from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-        from scipy import stats
-        import os
-        
-        # 建立視覺化資料夾
-        if not hasattr(self, 'timestamp'):
-            import datetime
-            self.timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        viz_dir = f"winprice_model_visualization_{self.timestamp}"
-        os.makedirs(viz_dir, exist_ok=True)
-        
-        # 設定中文字體
-        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
-        plt.rcParams['axes.unicode_minus'] = False
-        
-        # 1. 準備生存分析所需的 duration 和 event 欄位
+
+        # 1. 準備生存分析所需的 duration 和 event 欄位 (向量化操作)
         survival_base = pd.DataFrame({'bid_id': self.train_data['bid_id']})
         survival_base['event'] = np.where(
             (pd.notna(self.train_data['paying_price'])) & (self.train_data['paying_price'] > 0), 1, 0
@@ -669,442 +686,75 @@ class RTBBiddingSystem:
         survival_base['duration'] = np.where(
             survival_base['event'] == 1,
             self.train_data['paying_price'],
-            self.train_data['bidding_price'].fillna(0)
+            self.train_data['bidding_price'].fillna(0) # 若 bidding_price 也可能 NaN，則填充
         )
         
         # 處理 duration 可能為負值或極小值的情況
-        survival_base.loc[survival_base['duration'] <= 0, 'duration'] = 1e-6
-        
-        # 📊 視覺化1: Win-Price 分佈分析
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        
-        # 獲勝 vs 失敗分佈
-        win_prices = survival_base[survival_base['event'] == 1]['duration']
-        lose_prices = survival_base[survival_base['event'] == 0]['duration']
-        
-        if len(win_prices) > 0:
-            axes[0, 0].hist(win_prices, bins=min(50, max(1, len(win_prices)//10)), 
-                           alpha=0.7, label=f'獲勝價格 (n={len(win_prices)})', 
-                           color='green', density=True)
-        
-        if len(lose_prices) > 0:
-            axes[0, 0].hist(lose_prices, bins=min(50, max(1, len(lose_prices)//10)), 
-                           alpha=0.7, label=f'失敗價格 (n={len(lose_prices)})', 
-                           color='red', density=True)
-        
-        axes[0, 0].set_xlabel('價格')
-        axes[0, 0].set_ylabel('密度')
-        axes[0, 0].set_title('獲勝 vs 失敗價格分佈', fontweight='bold')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # 對數價格分佈
-        if len(win_prices) > 0:
-            log_win_prices = np.log(win_prices)
-            axes[0, 1].hist(log_win_prices, bins=min(50, max(1, len(log_win_prices)//10)), 
-                           alpha=0.7, label='獲勝 (對數)', color='green', density=True)
-        
-        if len(lose_prices) > 0:
-            log_lose_prices = np.log(lose_prices)
-            axes[0, 1].hist(log_lose_prices, bins=min(50, max(1, len(log_lose_prices)//10)), 
-                           alpha=0.7, label='失敗 (對數)', color='red', density=True)
-        
-        axes[0, 1].set_xlabel('對數價格')
-        axes[0, 1].set_ylabel('密度')
-        axes[0, 1].set_title('對數價格分佈', fontweight='bold')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # 獲勝率隨價格變化
-        if len(survival_base) > 20:  # 確保有足夠的資料點
-            try:
-                price_bins = np.percentile(survival_base['duration'], np.linspace(0, 100, 21))
-                win_rates = []
-                bin_centers = []
-                
-                for i in range(len(price_bins)-1):
-                    mask = (survival_base['duration'] >= price_bins[i]) & (survival_base['duration'] < price_bins[i+1])
-                    if mask.sum() > 0:
-                        win_rate = survival_base[mask]['event'].mean()
-                        win_rates.append(win_rate)
-                        bin_centers.append((price_bins[i] + price_bins[i+1]) / 2)
-                
-                if len(win_rates) > 0:
-                    axes[1, 0].plot(bin_centers, win_rates, marker='o', linewidth=2, markersize=6)
-                    axes[1, 0].set_xlabel('價格區間')
-                    axes[1, 0].set_ylabel('獲勝率')
-                    axes[1, 0].set_title('獲勝率 vs 價格關係', fontweight='bold')
-                    axes[1, 0].grid(True, alpha=0.3)
-                else:
-                    axes[1, 0].text(0.5, 0.5, '資料不足\n無法分析價格關係', 
-                                   ha='center', va='center', transform=axes[1, 0].transAxes)
-            except Exception as e:
-                axes[1, 0].text(0.5, 0.5, f'價格分析錯誤\n{str(e)[:50]}...', 
-                               ha='center', va='center', transform=axes[1, 0].transAxes)
-        else:
-            axes[1, 0].text(0.5, 0.5, '資料量不足\n(<20個樣本)', 
-                           ha='center', va='center', transform=axes[1, 0].transAxes)
-        
-        # 統計摘要
-        axes[1, 1].axis('off')
-        win_mean = win_prices.mean() if len(win_prices) > 0 else 0
-        win_median = win_prices.median() if len(win_prices) > 0 else 0
-        win_std = win_prices.std() if len(win_prices) > 0 else 0
-        lose_mean = lose_prices.mean() if len(lose_prices) > 0 else 0
-        lose_median = lose_prices.median() if len(lose_prices) > 0 else 0
-        lose_std = lose_prices.std() if len(lose_prices) > 0 else 0
-        
-        stats_text = f"""
-        Win-Price 資料統計：
-        
-        總競價數: {len(survival_base):,}
-        獲勝數: {survival_base['event'].sum():,}
-        獲勝率: {survival_base['event'].mean():.4f}
-        
-        獲勝價格統計:
-        - 平均: {win_mean:.2f}
-        - 中位數: {win_median:.2f}
-        - 標準差: {win_std:.2f}
-        
-        失敗價格統計:
-        - 平均: {lose_mean:.2f}
-        - 中位數: {lose_median:.2f}
-        - 標準差: {lose_std:.2f}
-        """
-        axes[1, 1].text(0.1, 0.5, stats_text, fontsize=11, va='center',
-                        bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.3))
-        
-        plt.tight_layout()
-        plt.savefig(f'{viz_dir}/01_winprice_distribution_analysis.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        # 2. 合併特徵資料
+        survival_base.loc[survival_base['duration'] <= 0, 'duration'] = 1e-6 # 設為一個極小的正數
+
+        # 2. 合併特徵 (從已處理的 self.processed_train_df)
+        # 確保 'bid_id' 在 self.processed_train_df 中以便合併
         if 'bid_id' not in self.processed_train_df.columns:
+             # 如果原始 train_data 的索引就是 bid_id，或者可以從原始 train_data 獲取
+             # 這裡假設 self.train_data 包含 bid_id，並且與 self.processed_train_df 的行對應
+             # 為了安全，最好在 preprocess_features 中保留 bid_id，或確保可以合併
             print("警告：processed_train_df 中缺少 'bid_id'，嘗試從原始 train_data 添加。")
+            # 這裡假設 self.processed_train_df 的索引與 self.train_data['bid_id'] 對應
+            # 這是一個簡化處理，實際情況可能需要更精確的對齊
             if len(self.processed_train_df) == len(self.train_data):
-                self.processed_train_df['bid_id'] = self.train_data['bid_id'].values
+                 self.processed_train_df['bid_id'] = self.train_data['bid_id'].values
             else:
-                print("錯誤：無法安全地將 'bid_id' 添加到 processed_train_df。")
-                return
-        
+                 print("錯誤：無法安全地將 'bid_id' 添加到 processed_train_df。")
+                 return
+
         features_to_merge = self.processed_train_df[['bid_id'] + self.feature_columns]
         survival_df = pd.merge(survival_base, features_to_merge, on='bid_id', how='left')
-        
+
         # 3. 計算 log_duration
-        survival_df['log_duration'] = np.log(survival_df['duration'])
-        
-        # 4. 選擇特徵
-        self.winprice_features = self.feature_columns[:15]
+        survival_df['log_duration'] = np.log(survival_df['duration']) # duration 已處理為正數
+
+        # 4. 選擇用於 Win-Price 模型的特徵
+        # 可以選擇與 CTR 模型不同的特徵子集，或相同的
+        self.winprice_features = self.feature_columns[:15] # 例如選擇前15個特徵
+        # 確保 'bidding_price' (如果它在 feature_columns 中) 不被用於預測它自己
         if 'bidding_price' in self.winprice_features:
             self.winprice_features.remove('bidding_price')
         
         if not self.winprice_features:
             print("錯誤：沒有為 Win-Price 模型選擇任何特徵。")
             return
-        
-        # 5. 資料清理
+
+        # 5. 檢查並處理 NaN 值 (在傳遞給 lifelines 之前)
         cols_for_lifelines = ['log_duration', 'event'] + self.winprice_features
         final_survival_df_for_fit = survival_df[cols_for_lifelines].copy()
-        
+
         for col in cols_for_lifelines:
             if final_survival_df_for_fit[col].isnull().any():
                 print(f"警告：Win-Price 模型的欄位 '{col}' 中存在 NaN 值。")
                 if pd.api.types.is_numeric_dtype(final_survival_df_for_fit[col]):
-                    fill_value = final_survival_df_for_fit[col].median()
-                    if pd.isna(fill_value): 
-                        fill_value = 0
+                    fill_value = final_survival_df_for_fit[col].median() # 或 mean()
+                    if pd.isna(fill_value): fill_value = 0 # 如果中位數也是 NaN
                     print(f"正在用中位數/0 ({fill_value}) 填充 '{col}' 中的 NaN。")
                     final_survival_df_for_fit[col].fillna(fill_value, inplace=True)
+                else: # 理論上都應該是數值型了
+                    print(f"欄位 '{col}' 不是數值型且有 NaN，無法自動填充。")
+                    # 可能需要移除這些行或更特定的處理
+                    final_survival_df_for_fit.dropna(subset=[col], inplace=True)
         
+        # 移除仍然包含 NaN/inf 的行 (最後的保險)
         final_survival_df_for_fit.replace([np.inf, -np.inf], np.nan, inplace=True)
         final_survival_df_for_fit.dropna(inplace=True)
-        
+
         if final_survival_df_for_fit.empty:
             print("錯誤：處理 NaN 後，Win-Price 模型沒有可用的訓練資料。")
             return
         
-        # 🔄 6. 交叉驗證評估
-        print("執行交叉驗證...")
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        cv_scores = {
-            'concordance_index': [],
-            'log_likelihood': [],
-            'prediction_errors': []
-        }
-        
-        fold_predictions = []
-        fold_actuals = []
-        
-        for fold, (train_idx, val_idx) in enumerate(kf.split(final_survival_df_for_fit)):
-            print(f"訓練第 {fold+1}/5 折...")
-            
-            train_fold = final_survival_df_for_fit.iloc[train_idx]
-            val_fold = final_survival_df_for_fit.iloc[val_idx]
-            
-            # 檢查正樣本數量
-            train_events = train_fold['event'].sum()
-            if train_events < 2:
-                print(f"第 {fold+1} 折正樣本過少 ({train_events})，跳過")
-                continue
-            
-            try:
-                # 訓練模型
-                aft_fold = WeibullAFTFitter()
-                aft_fold.fit(train_fold, duration_col='log_duration', event_col='event')
-                
-                # 預測驗證集
-                val_predictions = aft_fold.predict_median(val_fold[self.winprice_features])
-                val_actual = val_fold['log_duration'].values
-                
-                # 計算評估指標
-                concordance = aft_fold.concordance_index_
-                log_likelihood = aft_fold.log_likelihood_
-                
-                # 只對有事件發生的樣本計算預測誤差
-                event_mask = val_fold['event'] == 1
-                if event_mask.sum() > 0:
-                    pred_error = mean_absolute_error(
-                        val_actual[event_mask], 
-                        val_predictions.values[event_mask]
-                    )
-                    cv_scores['prediction_errors'].append(pred_error)
-                
-                cv_scores['concordance_index'].append(concordance)
-                cv_scores['log_likelihood'].append(log_likelihood)
-                
-                fold_predictions.extend(val_predictions.values)
-                fold_actuals.extend(val_actual)
-                
-            except Exception as e:
-                print(f"第 {fold+1} 折訓練失敗: {e}")
-                continue
-        
-        # 📊 視覺化2: 交叉驗證結果
-        if cv_scores['concordance_index']:
-            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-            
-            # 一致性指數分佈
-            axes[0, 0].hist(cv_scores['concordance_index'], bins=10, alpha=0.7, color='skyblue', edgecolor='black')
-            axes[0, 0].axvline(np.mean(cv_scores['concordance_index']), color='red', linestyle='--', 
-                              label=f'平均: {np.mean(cv_scores["concordance_index"]):.4f}')
-            axes[0, 0].set_xlabel('Concordance Index')
-            axes[0, 0].set_ylabel('頻率')
-            axes[0, 0].set_title('交叉驗證 - Concordance Index 分佈', fontweight='bold')
-            axes[0, 0].legend()
-            axes[0, 0].grid(True, alpha=0.3)
-            
-            # 對數似然分佈
-            axes[0, 1].hist(cv_scores['log_likelihood'], bins=10, alpha=0.7, color='lightgreen', edgecolor='black')
-            axes[0, 1].axvline(np.mean(cv_scores['log_likelihood']), color='red', linestyle='--',
-                              label=f'平均: {np.mean(cv_scores["log_likelihood"]):.2f}')
-            axes[0, 1].set_xlabel('Log Likelihood')
-            axes[0, 1].set_ylabel('頻率')
-            axes[0, 1].set_title('交叉驗證 - Log Likelihood 分佈', fontweight='bold')
-            axes[0, 1].legend()
-            axes[0, 1].grid(True, alpha=0.3)
-            
-            # 預測 vs 實際散點圖
-            if fold_predictions and fold_actuals:
-                axes[1, 0].scatter(fold_actuals, fold_predictions, alpha=0.5, s=1)
-                axes[1, 0].plot([min(fold_actuals), max(fold_actuals)], 
-                               [min(fold_actuals), max(fold_actuals)], 'r--', lw=2)
-                axes[1, 0].set_xlabel('實際對數價格')
-                axes[1, 0].set_ylabel('預測對數價格')
-                axes[1, 0].set_title('預測 vs 實際值', fontweight='bold')
-                axes[1, 0].grid(True, alpha=0.3)
-                
-                # 計算相關係數
-                correlation = np.corrcoef(fold_actuals, fold_predictions)[0, 1]
-                axes[1, 0].text(0.05, 0.95, f'相關係數: {correlation:.4f}', 
-                               transform=axes[1, 0].transAxes, fontsize=12,
-                               bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.5))
-            
-            # 🔧 修正：交叉驗證摘要 - 預先計算條件值
-            axes[1, 1].axis('off')
-            avg_pred_error = np.mean(cv_scores['prediction_errors']) if cv_scores['prediction_errors'] else None
-            pred_error_str = f"{avg_pred_error:.4f}" if avg_pred_error is not None else "N/A"
-            stability_str = '✅ 良好' if np.std(cv_scores['concordance_index']) < 0.05 else '⚠️ 需改進'
-            
-            cv_summary = f"""
-            交叉驗證結果摘要：
-            
-            Concordance Index:
-            - 平均: {np.mean(cv_scores['concordance_index']):.4f}
-            - 標準差: {np.std(cv_scores['concordance_index']):.4f}
-            - 範圍: [{np.min(cv_scores['concordance_index']):.4f}, 
-                    {np.max(cv_scores['concordance_index']):.4f}]
-            
-            Log Likelihood:
-            - 平均: {np.mean(cv_scores['log_likelihood']):.2f}
-            - 標準差: {np.std(cv_scores['log_likelihood']):.2f}
-            
-            預測誤差 (MAE):
-            - 平均: {pred_error_str}
-            
-            模型穩定性: {stability_str}
-            """
-            axes[1, 1].text(0.1, 0.5, cv_summary, fontsize=10, va='center',
-                            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.5))
-            
-            plt.tight_layout()
-            plt.savefig(f'{viz_dir}/02_cross_validation_results.png', dpi=300, bbox_inches='tight')
-            plt.close()
-        
-        # 7. 訓練最終模型
-        print("訓練最終 Win-Price 模型...")
+        # 6. 訓練 Weibull AFT 模型
         try:
             aft = WeibullAFTFitter()
             aft.fit(final_survival_df_for_fit, duration_col='log_duration', event_col='event')
             self.winprice_model = aft
-            
-            # 📊 視覺化3: 模型係數分析
-            plt.figure(figsize=(12, 8))
-            
-            # 獲取模型係數
-            coefficients = aft.params_.drop(['lambda_', 'rho_'])  # 移除 Weibull 參數
-            
-            # 繪製係數重要性
-            sorted_coef = coefficients.abs().sort_values()
-            colors = ['red' if x < 0 else 'blue' for x in coefficients[sorted_coef.index]]
-            
-            bars = plt.barh(range(len(sorted_coef)), sorted_coef.values, color=colors, alpha=0.7)
-            plt.yticks(range(len(sorted_coef)), sorted_coef.index)
-            plt.xlabel('係數絕對值')
-            plt.title('Win-Price 模型特徵係數重要性', fontsize=14, fontweight='bold')
-            plt.grid(True, alpha=0.3)
-            
-            # 添加數值標籤
-            for i, (bar, coef_name) in enumerate(zip(bars, sorted_coef.index)):
-                original_coef = coefficients[coef_name]
-                plt.text(sorted_coef[coef_name] * 1.02, i, f'{original_coef:.3f}', 
-                        va='center', fontweight='bold')
-            
-            # 添加圖例
-            plt.axvline(0, color='black', linestyle='-', alpha=0.3)
-            red_patch = plt.Rectangle((0, 0), 1, 1, facecolor='red', alpha=0.7, label='負係數 (降低價格)')
-            blue_patch = plt.Rectangle((0, 0), 1, 1, facecolor='blue', alpha=0.7, label='正係數 (提高價格)')
-            plt.legend(handles=[red_patch, blue_patch], loc='lower right')
-            
-            plt.tight_layout()
-            plt.savefig(f'{viz_dir}/03_model_coefficients.png', dpi=300, bbox_inches='tight')
-            plt.close()
-            
-            # 📊 視覺化4: 價格分佈對比 - 快速修復版本
-            plt.figure(figsize=(12, 8))
-            
-            # 🔧 簡化：不繪製複雜的存活曲線，改用價格分佈對比
-            event_prices = final_survival_df_for_fit[final_survival_df_for_fit['event'] == 1]['log_duration']
-            censor_prices = final_survival_df_for_fit[final_survival_df_for_fit['event'] == 0]['log_duration']
-            
-            if len(event_prices) > 0:
-                plt.hist(event_prices, bins=20, alpha=0.7, color='green', 
-                         label=f'獲勝價格 (n={len(event_prices)})', density=True)
-            
-            if len(censor_prices) > 0:
-                plt.hist(censor_prices, bins=20, alpha=0.7, color='red',
-                         label=f'失敗價格 (n={len(censor_prices)})', density=True)
-            
-            plt.xlabel('對數價格')
-            plt.ylabel('密度')
-            plt.title('Win-Price 價格分佈對比', fontsize=14, fontweight='bold')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.savefig(f'{viz_dir}/04_price_distribution_comparison.png', dpi=300, bbox_inches='tight')
-            plt.close()
-            
-            print("✅ 價格分佈對比圖已生成")
-    
-            # 💾 儲存模型報告 - 修正版本
-            try:
-                # 🔧 修正：安全地處理 Series 格式化
-                top_coefficients = coefficients.abs().sort_values(ascending=False).head()
-                
-                # 將 Series 轉換為字符串格式
-                coef_strings = []
-                for feature, coef_val in top_coefficients.items():
-                    original_coef = coefficients[feature]
-                    coef_strings.append(f"  {feature}: {original_coef:.6f}")
-                
-                top_coef_text = "\n".join(coef_strings)
-                
-                # 🔧 修正：處理可能的 NaN 值
-                concordance_val = getattr(aft, 'concordance_index_', 0)
-                log_likelihood_val = getattr(aft, 'log_likelihood_', 0)
-                aic_val = getattr(aft, 'AIC_', 0)
-                lambda_val = aft.params_.get('lambda_', 0)
-                rho_val = aft.params_.get('rho_', 0)
-                
-                # 安全的交叉驗證統計
-                cv_concordance_mean = np.mean(cv_scores['concordance_index']) if cv_scores['concordance_index'] else 0
-                cv_concordance_std = np.std(cv_scores['concordance_index']) if cv_scores['concordance_index'] else 0
-                cv_likelihood_mean = np.mean(cv_scores['log_likelihood']) if cv_scores['log_likelihood'] else 0
-                cv_likelihood_std = np.std(cv_scores['log_likelihood']) if cv_scores['log_likelihood'] else 0
-                
-                model_report = f"""Win-Price 模型訓練報告
-    =====================
-    
-    資料統計：
-    - 總樣本數: {len(final_survival_df_for_fit):,}
-    - 獲勝樣本數: {final_survival_df_for_fit['event'].sum():,}
-    - 獲勝率: {final_survival_df_for_fit['event'].mean():.4f}
-    
-    特徵選擇：
-    - 使用特徵數: {len(self.winprice_features)}
-    - 特徵列表: {', '.join(self.winprice_features[:10])}{'...' if len(self.winprice_features) > 10 else ''}
-    
-    模型性能 (交叉驗證):
-    - 平均 Concordance Index: {cv_concordance_mean:.4f} ± {cv_concordance_std:.4f}
-    - 平均 Log Likelihood: {cv_likelihood_mean:.2f} ± {cv_likelihood_std:.2f}
-    - 平均預測誤差 (MAE): {pred_error_str}
-    
-    最終模型參數：
-    - Concordance Index: {concordance_val:.4f}
-    - Log Likelihood: {log_likelihood_val:.2f}
-    - AIC: {aic_val:.2f}
-    
-    Weibull 分佈參數：
-    - Lambda (尺度參數): {lambda_val:.4f}
-    - Rho (形狀參數): {rho_val:.4f}
-    
-    前5個重要特徵係數：
-    {top_coef_text}
-    
-    視覺化檔案已儲存至: {viz_dir}/
-    """
-            
-                with open(f'{viz_dir}/winprice_model_report.txt', 'w', encoding='utf-8') as f:
-                    f.write(model_report)
-                
-                print(f"✅ Win-Price 模型訓練完成!")
-                print(f"📊 Concordance Index: {concordance_val:.4f}")
-                print(f"📊 Log Likelihood: {log_likelihood_val:.2f}")
-                print(f"📁 視覺化檔案已儲存至: {viz_dir}/")
-                print(f"📄 模型報告已儲存: {viz_dir}/winprice_model_report.txt")
-            
-            except Exception as report_error:
-                print(f"⚠️ 生成模型報告時發生錯誤: {report_error}")
-                # 簡化版本的報告
-                simple_report = f"""Win-Price 模型訓練完成
-    
-    基本統計：
-    - 總樣本數: {len(final_survival_df_for_fit)}
-    - 獲勝樣本數: {final_survival_df_for_fit['event'].sum()}
-    - 使用特徵數: {len(self.winprice_features)}
-    
-    模型已訓練完成，視覺化檔案已儲存至: {viz_dir}/
-    """
-                
-                try:
-                    with open(f'{viz_dir}/winprice_model_simple_report.txt', 'w', encoding='utf-8') as f:
-                        f.write(simple_report)
-                    print("✅ 已生成簡化版模型報告")
-                except:
-                    print("⚠️ 無法生成報告檔案")
-                
-                print(f"✅ Win-Price 模型訓練完成 (簡化版)")
-                print(f"📁 視覺化檔案已儲存至: {viz_dir}/")
-                
+            print("Win-Price 模型訓練完成。")
         except Exception as e:
             print(f"訓練 Win-Price 模型時發生嚴重錯誤: {e}")
             import traceback
@@ -1112,39 +762,48 @@ class RTBBiddingSystem:
             self.winprice_model = None
 
 
-    def predict_winprice(self, row_series):
-        """預測單筆資料的勝價 - 極度保守版本"""
+    def predict_CTR(self, row_series):
+        """預測單筆資料的 CTR"""
+        if self.ctr_model is None:
+            # print("警告：CTR 模型未訓練，返回預設 pctr_min。")
+            return self.pctr_min
+        
         try:
-            if self.winprice_model is None:
-                floor_price = row_series.get('ad_slot_floor_price', 1)
-                return max(int(floor_price * 1.05), 1)  # 只比底價高5%
-            
+            # 將 Series 轉換為 DataFrame 以便 preprocess_features 處理
             df_row = pd.DataFrame([row_series])
             processed_df_row = self.preprocess_features(df_row, is_train=False)
-            features_for_prediction = processed_df_row[self.feature_columns_winprice].fillna(0)
             
-            try:
-                    log_duration = self.winprice_model.predict_expectation(features_for_prediction.iloc[0]).iloc[0]
-                    raw_pred = np.exp(log_duration)
-            except Exception:
-                    raw_pred = 15
+            # 確保特徵順序和數量與訓練時一致
+            features_for_prediction = processed_df_row[self.feature_columns]
             
-            # 根據分析結果：你需要降低到原來的 1/30
-            floor_price = row_series.get('ad_slot_floor_price', 1)
-            
-            # 極度保守調整
-            conservative_pred = max(
-                raw_pred * 0.03,     # 預測值的3% (原來高估30倍)
-                floor_price * 1.02,  # 或底價的102%
-                1
-            )
-            
-            # 最高限制：絕對不超過8元
-            return min(int(conservative_pred), 8)
-            
+            pred = self.ctr_model.predict(features_for_prediction, num_iteration=self.ctr_model.best_iteration)[0]
+            return max(float(pred), self.pctr_min) # 確保是 float
         except Exception as e:
-            floor_price = row_series.get('ad_slot_floor_price', 1)
-            return max(int(floor_price), 1)
+            # print(f"CTR 預測錯誤: {e}。返回預設 pctr_min。")
+            return self.pctr_min
+
+    def predict_winprice(self, row_series):
+        """預測單筆資料的勝價"""
+        if self.winprice_model is None or not self.winprice_features:
+            # print("警告：Win-Price 模型未訓練或特徵未設定，返回基於 bidding_price 的估計。")
+            # 使用一個簡單的備用策略，例如出價的某個百分比
+            return max(int(row_series.get('bidding_price', 10) * 0.7), 1) # 假設 bidding_price 存在
+        
+        try:
+            df_row = pd.DataFrame([row_series])
+            processed_df_row = self.preprocess_features(df_row, is_train=False)
+            
+            # 確保特徵與 Win-Price 模型訓練時一致
+            features_for_prediction = processed_df_row[self.winprice_features]
+
+            # lifelines 期望 DataFrame
+            log_pred_duration = self.winprice_model.predict_expectation(features_for_prediction)[0]
+            predicted_price = np.exp(log_pred_duration)
+            
+            return max(int(predicted_price), 1) # 返回整數價格，至少為1
+        except Exception as e:
+            # print(f"Win-Price 預測錯誤: {e}。返回基於 bidding_price 的估計。")
+            return max(int(row_series.get('bidding_price', 10) * 0.7), 1)
 
 
     def predict_CTR_from_processed(self, processed_features_row):
@@ -1156,9 +815,6 @@ class RTBBiddingSystem:
             # 確保傳入的特徵與訓練時的 feature_columns 順序和名稱一致
             pred = self.ctr_model.predict(pd.DataFrame([processed_features_row[self.feature_columns]]), num_iteration=self.ctr_model.best_iteration)[0]
             return max(float(pred), self.pctr_min)
-        except Exception as e:
-            # print(f"CTR 預測 (processed) 錯誤: {e}")
-            return self.pctr_min
         except Exception as e:
             # print(f"CTR 預測 (processed) 錯誤: {e}")
             return self.pctr_min
@@ -1182,10 +838,9 @@ class RTBBiddingSystem:
 
 
     def bid_day1(self):
-
         """執行 Day1 的出價邏輯"""
         print("執行 Day1 出價...")
-        if self.test_day2 is None:
+        if self.test_day1 is None:
             print("錯誤：測試資料未載入。")
             return None
         if self.ctr_model is None or self.winprice_model is None:
@@ -1198,7 +853,7 @@ class RTBBiddingSystem:
         
         # 預處理整個測試集
         print("預處理整個測試集進行出價...")
-        processed_test_df = self.preprocess_features(self.test_day2.copy(), is_train=False)
+        processed_test_df = self.preprocess_features(self.test_day1.copy(), is_train=False)
         print("測試集預處理完成。")
 
         # 批量預測CTR
@@ -1243,7 +898,7 @@ class RTBBiddingSystem:
 
         for idx in range(len(processed_test_df)):
             processed_row = processed_test_df.iloc[idx]
-            original_row = self.test_day2.iloc[idx]
+            original_row = self.test_day1.iloc[idx]
 
             current_hour = int(processed_row.get('hour', 0))
             bid_id = original_row.get('bid_id', f"unknown_bid_{idx}")
@@ -1294,163 +949,12 @@ class RTBBiddingSystem:
 
         # 儲存結果
         result_df = pd.DataFrame(bid_results)
-        output_filename = f"{self.student_id}_day1_{self.timestamp}.csv"    # 修改這行
+        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")  # 新增這行
+        output_filename = f"{self.student_id}_day1_{now_str}.csv"    # 修改這行
         result_df.to_csv(output_filename, index=False)
         print(f"\nDay1 出價完成，結果已儲存至: {output_filename}")
         print(f"總出價次數 (paying_price > 0): {(result_df['paying_price'] > 0).sum()}")
         print(f"總出價金額 (假設都贏得且按此價格支付): {result_df['paying_price'].sum()}")
-        print(f"剩餘總預算: {remaining_budget:.2f}")
-        
-        return result_df
-
-    def bid_day2(self):
-        """執行 Day2 的出價邏輯 - 加入保守微調"""
-        print("執行 Day2 出價...")
-        if self.test_day2 is None:
-            print("錯誤：測試資料未載入。")
-            return None
-        if self.ctr_model is None or self.winprice_model is None:
-            print("錯誤：一個或多個模型未訓練。無法執行出價。")
-            return None
-
-        remaining_budget = self.DAY_BUDGET
-        spent_per_hour = [0] * 24
-        bid_results = []
-        
-        # 預處理整個測試集
-        print("預處理整個測試集進行出價...")
-        processed_test_df = self.preprocess_features(self.test_day2.copy(), is_train=False)
-        print("測試集預處理完成。")
-
-        # 批量預測CTR
-        batch_size = 10000
-        for i in range(0, len(processed_test_df), batch_size):
-            batch = processed_test_df.iloc[i:i+batch_size]
-            ctr_preds = self.ctr_model.predict(
-                batch[self.feature_columns], 
-                num_iteration=self.ctr_model.best_iteration
-            )
-            processed_test_df.loc[batch.index, 'predicted_ctr'] = ctr_preds
-        
-        # 檢查CTR預測結果
-        print(f"CTR預測結果統計:")
-        print(f"- 平均值: {processed_test_df['predicted_ctr'].mean()}")
-        print(f"- 最小值: {processed_test_df['predicted_ctr'].min()}")
-        print(f"- 最大值: {processed_test_df['predicted_ctr'].max()}")
-        print(f"- 高於閾值({self.pctr_min})的比例: {(processed_test_df['predicted_ctr'] > self.pctr_min).mean()*100:.2f}%")
-        
-        # 批量預測win_price
-        batch_size = 10000
-        for i in range(0, len(processed_test_df), batch_size):
-            batch = processed_test_df.iloc[i:i+batch_size]
-            batch_winprice = batch[self.winprice_features].copy()
-            batch_winprice = batch_winprice.fillna(0)
-            win_price_preds = self.winprice_model.predict_expectation(batch_winprice)
-            processed_test_df.loc[batch.index, 'predicted_win_price'] = np.exp(win_price_preds)
-        
-        # 檢查win_price預測結果
-        print(f"Win-Price預測結果統計:")
-        print(f"- 平均值: {processed_test_df['predicted_win_price'].mean()}")
-        print(f"- 最小值: {processed_test_df['predicted_win_price'].min()}")
-        print(f"- 最大值: {processed_test_df['predicted_win_price'].max()}")
-        print("Win-Price 預測用特徵 NaN 檢查：")
-        print(processed_test_df[self.winprice_features].isnull().sum())
-        print("Win-Price 預測用特徵型態：")
-        print(processed_test_df[self.winprice_features].dtypes)
-        
-        # 簡化出價策略，確保有出價
-        num_bids_made = 0
-        total_spent_if_won = 0
-
-        for idx in range(len(processed_test_df)):
-            processed_row = processed_test_df.iloc[idx]
-            original_row = self.test_day2.iloc[idx]
-
-            current_hour = int(processed_row.get('hour', 0))
-            bid_id = original_row.get('bid_id', f"unknown_bid_{idx}")
-            
-            bid_price_for_this_impression = 0
-
-            if spent_per_hour[current_hour] >= self.hourly_budget[current_hour] or remaining_budget <= 0:
-                bid_price_for_this_impression = 0
-            else:
-                predicted_ctr = processed_row.get('predicted_ctr', self.pctr_min)
-                
-                # 放寬CTR閾值條件
-                if predicted_ctr < self.pctr_min * 0.1:  # 降低閾值為原來的10%
-                    bid_price_for_this_impression = 0
-                else:
-                    predicted_win_price = processed_row.get('predicted_win_price', 0)
-                    
-                    # 修正：處理 NaN 或 inf
-                    if not np.isfinite(predicted_win_price) or predicted_win_price <= 0:
-                        predicted_win_price = 1  # 給一個最小有效值
-
-                    # ========== 新增：保守出價策略 (來自 bid_day2) ==========
-                    floor_price = original_row.get('ad_slot_floor_price', 1)
-                    pctr = predicted_ctr
-                    
-                    # 三種策略取最小值
-                    strategy1 = int(predicted_win_price * 0.6)  # 預測值60%
-                    strategy2 = int(floor_price * 1.01)         # 底價101%
-                    strategy3 = max(1, int(pctr * 100000))      # 基於CTR的出價
-                    potential_bid = min(strategy1, strategy2, strategy3, 5)  # 最高5元
-                    
-                    # 額外性價比檢查
-                    if potential_bid > 0:
-                        rho = pctr / max(potential_bid, 1)
-                        if rho < 2e-4:
-                            potential_bid = 0
-                    # ========== 保守出價策略結束 ==========
-                    
-                    # 確保最小出價
-                    if potential_bid > 0:
-                        potential_bid = max(potential_bid, 1)
-                    
-                    # 檢查預算限制
-                    if potential_bid > 0 and remaining_budget >= potential_bid and \
-                    (spent_per_hour[current_hour] + potential_bid) <= self.hourly_budget[current_hour]:
-                        bid_price_for_this_impression = potential_bid
-                    else:
-                        bid_price_for_this_impression = 0
-            
-            if bid_price_for_this_impression > 0:
-                remaining_budget -= bid_price_for_this_impression
-                spent_per_hour[current_hour] += bid_price_for_this_impression
-                num_bids_made += 1
-                total_spent_if_won += bid_price_for_this_impression
-
-            bid_results.append({
-                'bid_id': bid_id,
-                'paying_price': bid_price_for_this_impression
-            })
-
-            if (idx + 1) % 50000 == 0:
-                print(f"已處理 {idx + 1}/{len(processed_test_df)} 筆競價請求. "
-                    f"剩餘總預算: {remaining_budget:.2f}. "
-                    f"出價次數: {num_bids_made}. "
-                    f"假設花費: {total_spent_if_won:.2f}")
-
-        # 儲存結果
-        result_df = pd.DataFrame(bid_results)
-        output_filename = f"{self.student_id}_day2_{self.timestamp}.csv"
-        result_df.to_csv(output_filename, index=False)
-        
-        # 增強統計資訊
-        final_bid_count = (result_df['paying_price'] > 0).sum()
-        final_total = result_df['paying_price'].sum()
-        avg_bid = result_df[result_df['paying_price'] > 0]['paying_price'].mean() if final_bid_count > 0 else 0
-        
-        print(f"\nDay2 出價完成，結果已儲存至: {output_filename}")
-        print(f"總出價次數: {final_bid_count}")
-        print(f"實際花費: {final_total}")
-        print(f"預算利用率: {final_total/self.DAY_BUDGET*100:.1f}%")
-        print(f"平均出價: {avg_bid:.2f}")
-        
-        if final_bid_count > 0:
-            bid_range = result_df[result_df['paying_price'] > 0]['paying_price']
-            print(f"出價範圍: {bid_range.min()} - {bid_range.max()}")
-        
         print(f"剩餘總預算: {remaining_budget:.2f}")
         
         return result_df
@@ -1461,7 +965,7 @@ def check_data_files():
     """檢查必要的資料檔案是否存在"""
     required_files = [
         'data/train.csv',
-        'data/test_day2.csv'
+        'data/test_day1.csv'
     ]
     # 可選: 'data/Feature_Meaning.xlsx'
     
@@ -1509,8 +1013,8 @@ def run_rtb_pipeline():
         rtb_system.train_winprice_model()
         
         # 6. Day1 出價
-        print("\n--- 步驟 6: 執行 Day2 出價 ---")
-        rtb_system.bid_day2()
+        print("\n--- 步驟 6: 執行 Day1 出價 ---")
+        rtb_system.bid_day1()
         
         print(f"\n=== RTB 競價系統執行完成 ===")
         
