@@ -32,7 +32,7 @@ class RTBBiddingSystem:
 
         # 資料
         self.train_data = None
-        self.test_day1 = None
+        self.test_day2 = None
         self.X_train = None
         self.y_ctr = None
         self.feature_columns = None # 用於模型訓練的特徵欄位名稱
@@ -43,9 +43,9 @@ class RTBBiddingSystem:
         print("載入資料中...")
         try:
             self.train_data = pd.read_csv('data/train.csv')
-            self.test_day1 = pd.read_csv('data/test_day1.csv')
+            self.test_day2 = pd.read_csv('data/test_day2.csv')
             print(f"訓練集大小: {self.train_data.shape}")
-            print(f"測試集大小: {self.test_day1.shape}")
+            print(f"測試集大小: {self.test_day2.shape}")
         except FileNotFoundError as e:
             print(f"錯誤：找不到資料檔案 {e.filename}")
             raise
@@ -528,27 +528,38 @@ class RTBBiddingSystem:
             return self.pctr_min
 
     def predict_winprice(self, row_series):
-        """預測單筆資料的勝價"""
-        if self.winprice_model is None or not self.winprice_features:
-            # print("警告：Win-Price 模型未訓練或特徵未設定，返回基於 bidding_price 的估計。")
-            # 使用一個簡單的備用策略，例如出價的某個百分比
-            return max(int(row_series.get('bidding_price', 10) * 0.7), 1) # 假設 bidding_price 存在
-        
+        """預測單筆資料的勝價 - 極度保守版本"""
         try:
+            if self.winprice_model is None:
+                floor_price = row_series.get('ad_slot_floor_price', 1)
+                return max(int(floor_price * 1.05), 1)  # 只比底價高5%
+            
             df_row = pd.DataFrame([row_series])
             processed_df_row = self.preprocess_features(df_row, is_train=False)
+            features_for_prediction = processed_df_row[self.feature_columns_winprice].fillna(0)
             
-            # 確保特徵與 Win-Price 模型訓練時一致
-            features_for_prediction = processed_df_row[self.winprice_features]
-
-            # lifelines 期望 DataFrame
-            log_pred_duration = self.winprice_model.predict_expectation(features_for_prediction)[0]
-            predicted_price = np.exp(log_pred_duration)
+            try:
+                log_duration = self.winprice_model.predict_expectation(features_for_prediction.iloc[0]).iloc[0]
+                raw_pred = np.exp(log_duration)
+            except:
+                raw_pred = 15
             
-            return max(int(predicted_price), 1) # 返回整數價格，至少為1
+            # 根據分析結果：你需要降低到原來的 1/30
+            floor_price = row_series.get('ad_slot_floor_price', 1)
+            
+            # 極度保守調整
+            conservative_pred = max(
+                raw_pred * 0.03,     # 預測值的3% (原來高估30倍)
+                floor_price * 1.02,  # 或底價的102%
+                1
+            )
+            
+            # 最高限制：絕對不超過8元
+            return min(int(conservative_pred), 8)
+            
         except Exception as e:
-            # print(f"Win-Price 預測錯誤: {e}。返回基於 bidding_price 的估計。")
-            return max(int(row_series.get('bidding_price', 10) * 0.7), 1)
+            floor_price = row_series.get('ad_slot_floor_price', 1)
+            return max(int(floor_price), 1)
 
 
     def predict_CTR_from_processed(self, processed_features_row):
@@ -583,9 +594,10 @@ class RTBBiddingSystem:
 
 
     def bid_day1(self):
+
         """執行 Day1 的出價邏輯"""
         print("執行 Day1 出價...")
-        if self.test_day1 is None:
+        if self.test_day2 is None:
             print("錯誤：測試資料未載入。")
             return None
         if self.ctr_model is None or self.winprice_model is None:
@@ -598,7 +610,7 @@ class RTBBiddingSystem:
         
         # 預處理整個測試集
         print("預處理整個測試集進行出價...")
-        processed_test_df = self.preprocess_features(self.test_day1.copy(), is_train=False)
+        processed_test_df = self.preprocess_features(self.test_day2.copy(), is_train=False)
         print("測試集預處理完成。")
 
         # 批量預測CTR
@@ -643,7 +655,7 @@ class RTBBiddingSystem:
 
         for idx in range(len(processed_test_df)):
             processed_row = processed_test_df.iloc[idx]
-            original_row = self.test_day1.iloc[idx]
+            original_row = self.test_day2.iloc[idx]
 
             current_hour = int(processed_row.get('hour', 0))
             bid_id = original_row.get('bid_id', f"unknown_bid_{idx}")
@@ -704,13 +716,166 @@ class RTBBiddingSystem:
         
         return result_df
 
+    def bid_day2(self):
+        """執行 Day2 的出價邏輯 - 加入保守微調"""
+        print("執行 Day2 出價...")
+        if self.test_day2 is None:
+            print("錯誤：測試資料未載入。")
+            return None
+        if self.ctr_model is None or self.winprice_model is None:
+            print("錯誤：一個或多個模型未訓練。無法執行出價。")
+            return None
+
+        remaining_budget = self.DAY_BUDGET
+        spent_per_hour = [0] * 24
+        bid_results = []
+        
+        # 預處理整個測試集
+        print("預處理整個測試集進行出價...")
+        processed_test_df = self.preprocess_features(self.test_day2.copy(), is_train=False)
+        print("測試集預處理完成。")
+
+        # 批量預測CTR
+        batch_size = 10000
+        for i in range(0, len(processed_test_df), batch_size):
+            batch = processed_test_df.iloc[i:i+batch_size]
+            ctr_preds = self.ctr_model.predict(
+                batch[self.feature_columns], 
+                num_iteration=self.ctr_model.best_iteration
+            )
+            processed_test_df.loc[batch.index, 'predicted_ctr'] = ctr_preds
+        
+        # 檢查CTR預測結果
+        print(f"CTR預測結果統計:")
+        print(f"- 平均值: {processed_test_df['predicted_ctr'].mean()}")
+        print(f"- 最小值: {processed_test_df['predicted_ctr'].min()}")
+        print(f"- 最大值: {processed_test_df['predicted_ctr'].max()}")
+        print(f"- 高於閾值({self.pctr_min})的比例: {(processed_test_df['predicted_ctr'] > self.pctr_min).mean()*100:.2f}%")
+        
+        # 批量預測win_price
+        batch_size = 10000
+        for i in range(0, len(processed_test_df), batch_size):
+            batch = processed_test_df.iloc[i:i+batch_size]
+            batch_winprice = batch[self.winprice_features].copy()
+            batch_winprice = batch_winprice.fillna(0)
+            win_price_preds = self.winprice_model.predict_expectation(batch_winprice)
+            processed_test_df.loc[batch.index, 'predicted_win_price'] = np.exp(win_price_preds)
+        
+        # 檢查win_price預測結果
+        print(f"Win-Price預測結果統計:")
+        print(f"- 平均值: {processed_test_df['predicted_win_price'].mean()}")
+        print(f"- 最小值: {processed_test_df['predicted_win_price'].min()}")
+        print(f"- 最大值: {processed_test_df['predicted_win_price'].max()}")
+        print("Win-Price 預測用特徵 NaN 檢查：")
+        print(processed_test_df[self.winprice_features].isnull().sum())
+        print("Win-Price 預測用特徵型態：")
+        print(processed_test_df[self.winprice_features].dtypes)
+        
+        # 簡化出價策略，確保有出價
+        num_bids_made = 0
+        total_spent_if_won = 0
+
+        for idx in range(len(processed_test_df)):
+            processed_row = processed_test_df.iloc[idx]
+            original_row = self.test_day2.iloc[idx]
+
+            current_hour = int(processed_row.get('hour', 0))
+            bid_id = original_row.get('bid_id', f"unknown_bid_{idx}")
+            
+            bid_price_for_this_impression = 0
+
+            if spent_per_hour[current_hour] >= self.hourly_budget[current_hour] or remaining_budget <= 0:
+                bid_price_for_this_impression = 0
+            else:
+                predicted_ctr = processed_row.get('predicted_ctr', self.pctr_min)
+                
+                # 放寬CTR閾值條件
+                if predicted_ctr < self.pctr_min * 0.1:  # 降低閾值為原來的10%
+                    bid_price_for_this_impression = 0
+                else:
+                    predicted_win_price = processed_row.get('predicted_win_price', 0)
+                    
+                    # 修正：處理 NaN 或 inf
+                    if not np.isfinite(predicted_win_price) or predicted_win_price <= 0:
+                        predicted_win_price = 1  # 給一個最小有效值
+
+                    # ========== 新增：保守出價策略 (來自 bid_day2) ==========
+                    floor_price = original_row.get('ad_slot_floor_price', 1)
+                    pctr = predicted_ctr
+                    
+                    # 三種策略取最小值
+                    strategy1 = int(predicted_win_price * 0.6)  # 預測值60%
+                    strategy2 = int(floor_price * 1.01)         # 底價101%
+                    strategy3 = max(1, int(pctr * 100000))      # 基於CTR的出價
+                    potential_bid = min(strategy1, strategy2, strategy3, 5)  # 最高5元
+                    
+                    # 額外性價比檢查
+                    if potential_bid > 0:
+                        rho = pctr / max(potential_bid, 1)
+                        if rho < 2e-4:
+                            potential_bid = 0
+                    # ========== 保守出價策略結束 ==========
+                    
+                    # 確保最小出價
+                    if potential_bid > 0:
+                        potential_bid = max(potential_bid, 1)
+                    
+                    # 檢查預算限制
+                    if potential_bid > 0 and remaining_budget >= potential_bid and \
+                    (spent_per_hour[current_hour] + potential_bid) <= self.hourly_budget[current_hour]:
+                        bid_price_for_this_impression = potential_bid
+                    else:
+                        bid_price_for_this_impression = 0
+            
+            if bid_price_for_this_impression > 0:
+                remaining_budget -= bid_price_for_this_impression
+                spent_per_hour[current_hour] += bid_price_for_this_impression
+                num_bids_made += 1
+                total_spent_if_won += bid_price_for_this_impression
+
+            bid_results.append({
+                'bid_id': bid_id,
+                'paying_price': bid_price_for_this_impression
+            })
+
+            if (idx + 1) % 50000 == 0:
+                print(f"已處理 {idx + 1}/{len(processed_test_df)} 筆競價請求. "
+                    f"剩餘總預算: {remaining_budget:.2f}. "
+                    f"出價次數: {num_bids_made}. "
+                    f"假設花費: {total_spent_if_won:.2f}")
+
+        # 儲存結果
+        result_df = pd.DataFrame(bid_results)
+        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"{self.student_id}_day1_{now_str}.csv"
+        result_df.to_csv(output_filename, index=False)
+        
+        # 增強統計資訊
+        final_bid_count = (result_df['paying_price'] > 0).sum()
+        final_total = result_df['paying_price'].sum()
+        avg_bid = result_df[result_df['paying_price'] > 0]['paying_price'].mean() if final_bid_count > 0 else 0
+        
+        print(f"\nDay1 出價完成，結果已儲存至: {output_filename}")
+        print(f"總出價次數: {final_bid_count}")
+        print(f"實際花費: {final_total}")
+        print(f"預算利用率: {final_total/self.DAY_BUDGET*100:.1f}%")
+        print(f"平均出價: {avg_bid:.2f}")
+        
+        if final_bid_count > 0:
+            bid_range = result_df[result_df['paying_price'] > 0]['paying_price']
+            print(f"出價範圍: {bid_range.min()} - {bid_range.max()}")
+        
+        print(f"剩餘總預算: {remaining_budget:.2f}")
+        
+        return result_df
+
 # --- 以下是執行流程控制 (類似 run.py 的功能) ---
 
 def check_data_files():
     """檢查必要的資料檔案是否存在"""
     required_files = [
         'data/train.csv',
-        'data/test_day1.csv'
+        'data/test_day2.csv'
     ]
     # 可選: 'data/Feature_Meaning.xlsx'
     
@@ -759,7 +924,7 @@ def run_rtb_pipeline():
         
         # 6. Day1 出價
         print("\n--- 步驟 6: 執行 Day1 出價 ---")
-        rtb_system.bid_day1()
+        rtb_system.bid_day2()
         
         print(f"\n=== RTB 競價系統執行完成 ===")
         
