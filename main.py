@@ -18,6 +18,9 @@ class RTBBiddingSystem:
         self.DAY_BUDGET = 5000
         self.pctr_min = 1e-4  # 最低可接受的預測點擊率
         self.rho_cut = 2e-5   # 性價比門檻 (pCTR / win_price)
+
+        # 生成統一的時間戳
+        self.timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # 動態調整每小時預算，根據歷史競價情況分配，而不是均分
         hour_weights = [0.5, 0.3, 0.2, 0.2, 0.3, 0.5, 0.8, 1.2, 1.5, 1.3, 1.1, 1.0, 
@@ -300,8 +303,8 @@ class RTBBiddingSystem:
         from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve
         import os
         
-        # 建立視覺化資料夾
-        viz_dir = "ctr_model_visualization"
+        # 使用統一的時間戳建立資料夾
+        viz_dir = f"ctr_model_visualization_{self.student_id}_{self.timestamp}"
         os.makedirs(viz_dir, exist_ok=True)
         
         # 設定中文字體
@@ -923,8 +926,7 @@ class RTBBiddingSystem:
 
         # 儲存結果
         result_df = pd.DataFrame(bid_results)
-        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")  # 新增這行
-        output_filename = f"{self.student_id}_day1_{now_str}.csv"    # 修改這行
+        output_filename = f"{self.student_id}_day1_{self.timestamp}.csv"    # 修改這行
         result_df.to_csv(output_filename, index=False)
         print(f"\nDay1 出價完成，結果已儲存至: {output_filename}")
         print(f"總出價次數 (paying_price > 0): {(result_df['paying_price'] > 0).sum()}")
@@ -1063,8 +1065,7 @@ class RTBBiddingSystem:
 
         # 儲存結果
         result_df = pd.DataFrame(bid_results)
-        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"{self.student_id}_day1_{now_str}.csv"
+        output_filename = f"{self.student_id}_day2_{self.timestamp}.csv"
         result_df.to_csv(output_filename, index=False)
         
         # 增強統計資訊
@@ -1072,7 +1073,7 @@ class RTBBiddingSystem:
         final_total = result_df['paying_price'].sum()
         avg_bid = result_df[result_df['paying_price'] > 0]['paying_price'].mean() if final_bid_count > 0 else 0
         
-        print(f"\nDay1 出價完成，結果已儲存至: {output_filename}")
+        print(f"\nDay2 出價完成，結果已儲存至: {output_filename}")
         print(f"總出價次數: {final_bid_count}")
         print(f"實際花費: {final_total}")
         print(f"預算利用率: {final_total/self.DAY_BUDGET*100:.1f}%")
@@ -1140,7 +1141,7 @@ def run_rtb_pipeline():
         rtb_system.train_winprice_model()
         
         # 6. Day1 出價
-        print("\n--- 步驟 6: 執行 Day1 出價 ---")
+        print("\n--- 步驟 6: 執行 Day2 出價 ---")
         rtb_system.bid_day2()
         
         print(f"\n=== RTB 競價系統執行完成 ===")
