@@ -5,7 +5,7 @@ RTB 競價系統執行腳本
 
 import os
 import sys
-from main import RTBBiddingSystem
+from backup.程式.main import RTBBiddingSystem
 
 def check_data_files():
     """檢查必要的資料檔案是否存在"""

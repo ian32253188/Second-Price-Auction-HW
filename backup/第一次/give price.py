@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from main import RTBBiddingSystem
+from backup.程式.main import RTBBiddingSystem
 
 def bid_day1(model_system, test_data_path, student_id, day_budget=5000):
     """
